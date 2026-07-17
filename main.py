@@ -4,7 +4,7 @@ from database import SessionLocal, engine
 import model
 import os
 from sqlalchemy.orm import Session
-from schema import ChatbotCreate, UploadDocument, UserLogin, UserSignUp, CheckEmail, RefreshTokenRequest, UpdateChatbotInformation
+from schema import ChatbotCreate, UploadDocument, UserLogin, UserSignUp, CheckEmail, RefreshTokenRequest, UpdateChatbotInformation, InputMessages
 from model import Document, User
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from fastapi.security import OAuth2PasswordBearer
 import cloudinary
 import cloudinary.uploader
-from service import indexing
+from service import indexing, embedding_msg
 
 app = FastAPI()
 
@@ -305,7 +305,7 @@ def create_bot(chatbot: ChatbotCreate, db: Session = Depends(get_db), validate: 
             detail="Prompt is required."
         )
     
-    existing = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.name == chatbot.name).first()
+    existing = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.name == chatbot.name, model.ChatbotInformation.user_id == validate.id).first()
     if existing:
         raise HTTPException(
             status_code=400,
@@ -505,3 +505,130 @@ def get_chatbot_by_id(chatbot_id: int ,db: Session = Depends(get_db), validate: 
     return chatbot
 
 
+@app.post("/api/chat/{chatbot_id}")
+def new_chat(chatbot_id: int, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+    chatbot = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.id == chatbot_id).first()
+
+    if not chatbot:
+        raise HTTPException(
+            status_code=400,
+            detail="chatbot not found"
+        )
+
+    if chatbot.user_id != validate.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid chatbot"
+        )
+    
+    existing_chat = db.query(model.Chat).filter(model.Chat.chatbot_id == chatbot_id).first()
+    if existing_chat:
+        raise HTTPException(status_code=400, detail="Chat already exists for this chatbot")
+    
+    new_chat = model.Chat(
+        chatbot_id = chatbot_id,
+        created_at = datetime.utcnow()
+    )
+
+    db.add(new_chat)
+    db.commit()
+    db.refresh(new_chat)
+
+    return {
+        "message": "new chat created",
+        "chat_id": new_chat.id,
+        "created_at": new_chat.created_at
+        
+    }
+
+@app.post("/api/message/{chat_id}")
+def send_message(chat_id: int, message: InputMessages, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+    chat = db.query(model.Chat).join(model.ChatbotInformation).filter(
+        model.Chat.id == chat_id,
+        model.ChatbotInformation.user_id == validate.id
+    ).first()
+
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found or access denied")
+    
+    # retrival
+    # 1. ambil semua dokumen yang di select
+    # 2. ambil pertanyaan yang sudah di embed
+    # 3. hitung cosine similaritynya
+    # 4. ambil 5 paling mirip (makin kecil makin mirip)
+
+    
+    msg = message.message
+    if message.sender == "user":
+        embeded_msg = embedding_msg(msg)
+    else:
+        embeded_msg = None
+
+
+    new_message = model.Messages(
+        chat_id=chat_id,
+        message=msg,
+        embeded_message = embeded_msg,
+        sender=message.sender,
+        created_at=datetime.utcnow()
+    )
+
+    db.add(new_message)
+    db.commit()
+    db.refresh(new_message)
+
+    message = db.query(model.Messages).filter(model.Messages.id == new_message.id).first()
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="Message not found"
+        )
+    
+    if message.sender == "bot":
+        chat = db.query(model.Chat).filter(model.Chat.id == message.chat_id).first()
+
+        docs_selected = db.query(model.Document).filter(model.Document.chatbot_id == chat.chatbot_id, model.Document.selected == True).all()
+
+        selected_ids = [doc.id for doc in docs_selected]
+
+        distance = model.VectorData.embeded_chunk.cosine_distance(embeded_msg).label("distance")
+
+        context_chunk = (
+            db.query(model.VectorData).filter(model.VectorData.document_id.in_(selected_ids)).order_by(distance).limit(10).all()
+        )
+
+        result = [
+            {
+                "docs_id": c.document_id,
+                "chunk_text": c.chunk_text,
+                "page_number": c.page_number
+            }
+            for c in context_chunk
+        ]
+
+        return result
+    
+
+    return {
+        "id": new_message.id,
+        "message": new_message.message,
+        "sender": new_message.sender,
+        "created_at": new_message.created_at
+    }
+
+
+@app.post("/api/is-document-selected/{doc_id}")
+def select_document(doc_id: int, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+
+    document = db.query(model.Document).join(model.ChatbotInformation, model.Document.chatbot_id == model.ChatbotInformation.id).filter(model.Document.id == doc_id, model.ChatbotInformation.user_id == validate.id).first()
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or access denied"
+        )
+
+    document.selected =  not document.selected
+    db.commit()
+
+    return {"message": "document selected", "selected": document.selected}

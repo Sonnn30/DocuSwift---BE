@@ -78,20 +78,26 @@ async def extract_file(file_url: str, file_type: str):
 
 def chunking(text: str):
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size = 200,
-        chunk_overlap = 20
+        chunk_size = 400,
+        chunk_overlap = 60
     )
     chunk = text_splitter.split_text(text)
     return chunk
 
+embedding_model = HuggingFaceEmbeddings(
+    model_name="paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 def embedding(chunk: list):
-    embeding_model = HuggingFaceEmbeddings(
-        model_name="paraphrase-multilingual-MiniLM-L12-v2"
-    )
-    embeded = embeding_model.embed_documents(chunk)
+    embeded = embedding_model.embed_documents(chunk)
 
     return embeded
+
+def embedding_msg(msg: str):
+    embeded = embedding_model.embed_query(msg)
+
+    return embeded
+
 
 def to_string(data):
     if isinstance(data, str):

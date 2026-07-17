@@ -1,5 +1,5 @@
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, String, Integer, Enum, ForeignKey, DateTime
+from sqlalchemy import Column, String, Integer, Enum, ForeignKey, DateTime, Boolean
 from pgvector.sqlalchemy import Vector
 
 # ini fungsinya agar sql alchemy bisa mengidentifikasi class ini adalah table
@@ -53,6 +53,7 @@ class Document(Base):
     filename = Column(String)
     file_type = Column(String)
     file_url = Column(String)
+    selected = Column(Boolean, default=False)
     upload_at = Column(DateTime)
 
 class VectorData(Base):
@@ -63,3 +64,18 @@ class VectorData(Base):
     embeded_chunk = Column(Vector(384))
     page_number = Column(Integer)
     chunk_index = Column(Integer)
+
+class Chat(Base):
+    __tablename__ = "chat"
+    id = Column(Integer, primary_key=True, index=True)
+    chatbot_id = Column(Integer, ForeignKey(ChatbotInformation.id), unique=True)
+    created_at = Column(DateTime)
+
+class Messages(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey(Chat.id))
+    message = Column(String)
+    embeded_message = Column(Vector(384), nullable=True)
+    sender = Column(String)
+    created_at = Column(DateTime)

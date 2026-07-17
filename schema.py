@@ -32,3 +32,7 @@ class UpdateChatbotInformation(BaseModel):
     name: str
     prompt: str
     model: Literal["qwen/qwen3.6-27b", "llama-3.1-8b-instant"]
+
+class InputMessages(BaseModel):
+    message: str
+    sender: str
