@@ -78,7 +78,7 @@ async def extract_file(file_url: str, file_type: str):
 
 def chunking(text: str):
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size = 400,
+        chunk_size = 500,
         chunk_overlap = 60
     )
     chunk = text_splitter.split_text(text)

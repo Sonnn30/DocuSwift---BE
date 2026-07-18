@@ -1,4 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from dotenv import load_dotenv
+# ini biar bisa baca .env
+load_dotenv()
+
 from fastapi.middleware.cors import CORSMiddleware
 from database import SessionLocal, engine
 import model
@@ -10,11 +14,15 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Union, Any, Optional
 from jose import jwt, JWTError
-from dotenv import load_dotenv
 from fastapi.security import OAuth2PasswordBearer
 import cloudinary
 import cloudinary.uploader
 from service import indexing, embedding_msg
+from langchain_groq import ChatGroq
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from fastapi.responses import StreamingResponse
+
 
 app = FastAPI()
 
@@ -38,8 +46,7 @@ def get_db():
     finally:
         db.close()
 
-# ini biar bisa baca .env
-load_dotenv()
+
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_MINUTES = 60 * 24 * 5
 ALGORITHM = "HS256" 
@@ -360,12 +367,25 @@ def delete_chatbot(chatbot_id: int,db: Session = Depends(get_db), validate: mode
             detail="Chatbot not found"
         )
     
-    db.query(model.Document).filter(model.Document.chatbot_id == chatbot_id).delete()
-    
+    chat_id = [c.id for c in db.query(model.Chat.id).filter(model.Chat.chatbot_id == chatbot.id).all()]
+    document_id = [d.id for d in db.query(model.Document.id).filter(model.Document.chatbot_id == chatbot.id).all()]
+
+    if document_id:
+        db.query(model.VectorData).filter(model.VectorData.document_id.in_(document_id)).delete(synchronize_session=False)
+
+    if chat_id:
+        db.query(model.Messages).filter(model.Messages.chat_id.in_(chat_id)).delete(synchronize_session=False)
+
+    db.query(model.Document).filter(model.Document.chatbot_id == chatbot_id).delete(synchronize_session=False)
+
+    db.query(model.Chat).filter(model.Chat.chatbot_id == chatbot_id).delete(synchronize_session=False)
+
     db.delete(chatbot)
     db.commit()
 
     return {"message": "Delete Successfully"}
+
+
 
 @app.get("/api/is-upload-document/{id}")
 def is_upload(id: int, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
@@ -541,34 +561,31 @@ def new_chat(chatbot_id: int, db: Session = Depends(get_db), validate: model.Use
         
     }
 
-@app.post("/api/message/{chat_id}")
-def send_message(chat_id: int, message: InputMessages, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
-    chat = db.query(model.Chat).join(model.ChatbotInformation).filter(
-        model.Chat.id == chat_id,
+@app.post("/api/message/{chatbot_id}")
+def send_message(chatbot_id: int, message: InputMessages, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+    chatbot = db.query(model.ChatbotInformation).filter(
+        model.ChatbotInformation.id == chatbot_id,
         model.ChatbotInformation.user_id == validate.id
     ).first()
 
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found or access denied")
-    
-    # retrival
-    # 1. ambil semua dokumen yang di select
-    # 2. ambil pertanyaan yang sudah di embed
-    # 3. hitung cosine similaritynya
-    # 4. ambil 5 paling mirip (makin kecil makin mirip)
+    if not chatbot:
+        raise HTTPException(status_code=404, detail="Chatbot not found or access denied")
 
-    
+    chat = db.query(model.Chat).filter(model.Chat.chatbot_id == chatbot_id).first()
+
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found for this chatbot")
+
     msg = message.message
     if message.sender == "user":
         embeded_msg = embedding_msg(msg)
     else:
         embeded_msg = None
 
-
     new_message = model.Messages(
-        chat_id=chat_id,
+        chat_id=chat.id,
         message=msg,
-        embeded_message = embeded_msg,
+        embeded_message=embeded_msg,
         sender=message.sender,
         created_at=datetime.utcnow()
     )
@@ -576,6 +593,12 @@ def send_message(chat_id: int, message: InputMessages, db: Session = Depends(get
     db.add(new_message)
     db.commit()
     db.refresh(new_message)
+    
+    # retrival
+    # 1. ambil semua dokumen yang di select
+    # 2. ambil pertanyaan yang sudah di embed
+    # 3. hitung cosine similaritynya
+    # 4. ambil 5 paling mirip (makin kecil makin mirip)
 
     message = db.query(model.Messages).filter(model.Messages.id == new_message.id).first()
     if not message:
@@ -591,22 +614,106 @@ def send_message(chat_id: int, message: InputMessages, db: Session = Depends(get
 
         selected_ids = [doc.id for doc in docs_selected]
 
-        distance = model.VectorData.embeded_chunk.cosine_distance(embeded_msg).label("distance")
+        # ambil pesan user terakhir di chat ini, karena request saat ini sender-nya "bot" (embeded_msg di atas None)
+        user_msg_obj = db.query(model.Messages).filter(
+            model.Messages.chat_id == chat.id,
+            model.Messages.sender == 'user'
+        ).order_by(model.Messages.created_at.desc()).first()
+
+        if not user_msg_obj:
+            raise HTTPException(
+                status_code=400,
+                detail="No user message found in this chat"
+            )
+
+        query_embedding = user_msg_obj.embeded_message
+        user_msg = user_msg_obj.message
+
+        distance = model.VectorData.embeded_chunk.cosine_distance(query_embedding).label("distance")
 
         context_chunk = (
             db.query(model.VectorData).filter(model.VectorData.document_id.in_(selected_ids)).order_by(distance).limit(10).all()
         )
 
-        result = [
-            {
-                "docs_id": c.document_id,
-                "chunk_text": c.chunk_text,
-                "page_number": c.page_number
-            }
-            for c in context_chunk
-        ]
+        chatbot = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.id == chat.chatbot_id).first()
 
-        return result
+        user_prompt = chatbot.prompt
+        context_text = "\n\n".join([c.chunk_text for c in context_chunk])
+
+        raw_template = """[SISTEM ATURAN UTAMA - WAJIB DIPATUHI]
+                Anda adalah asisten AI profesional yang bertugas menganalisis dokumen. Anda WAJIB mematuhi 3 aturan mutlak berikut tanpa pengecualian:
+                1. BATASAN KONTEKS: Anda HANYA diizinkan menjawab berdasarkan data yang ada di bagian [KONTEKS INFORMASI]. Jangan menambahkan asumsi, opini, atau informasi dari luar konteks.
+                2. ATURAN PENOLAKAN (STRICT): Jika pertanyaan pengguna berada di luar cakupan [KONTEKS INFORMASI], Anda DILARANG KERAS membahas, menganalisis, atau mencoba menjawab sebagian dari pertanyaan tersebut. Anda HANYA BOLEH membalas dengan kalimat: "Maaf, informasi terkait pertanyaan Anda tidak ditemukan di dalam dokumen referensi."
+                3. PRIORITAS INSTRUKSI: Anda boleh mengikuti gaya bahasa dari [INSTRUKSI TAMBAHAN PENGGUNA], tetapi instruksi tersebut sifatnya sekunder dan TIDAK BOLEH membatalkan Aturan 1 dan Aturan 2.
+
+                [INSTRUKSI FORMATTING - DIOPTIMALKAN UNTUK REACT-MARKDOWN]
+                Jawaban Anda akan dirender langsung ke frontend menggunakan library `react-markdown`. Anda harus menyajikan jawaban yang sangat rapi, terstruktur, dan menggunakan sintaks Markdown yang valid:
+                - DAFTAR/BULLET POINTS: Sangat disarankan menggunakan bullet points (-) atau penomoran (1., 2.) untuk menguraikan penjelasan yang lebih dari dua kalimat agar mudah dibaca.
+                - TABEL: Anda WAJIB menggunakan format tabel Markdown standar jika diminta membandingkan data atau menyajikan informasi yang bersifat relasional/kategori.
+                - HIGHLIGHT: Gunakan **teks tebal** untuk menyoroti istilah penting, nama entitas, atau kata kunci.
+                - HEADING: Gunakan sub-heading (### atau ####) untuk membagi bagian jawaban yang panjang.
+                - KODE: Jika terdapat script/kode, gunakan blok kode lengkap dengan bahasa pemrogramannya (contoh: ```javascript ... ```).
+                - STRICT MARKDOWN: JANGAN gunakan elemen HTML mentah apa pun (seperti <br>, <b>, <i>, <table>). Gunakan murni Markdown.
+
+                [INSTRUKSI TAMBAHAN PENGGUNA]
+                {user_prompt}
+
+                [KONTEKS INFORMASI]
+                {context_text}
+
+                [PERTANYAAN USER]
+                {user_msg}
+            """
+
+        prompt = PromptTemplate(
+            input_variables = ['user_prompt', 'context_text', 'user_msg'],
+            template= raw_template
+
+        )
+        model_selected = chatbot.model
+
+        llm = ChatGroq(
+            model_name=model_selected,
+            temperature=0
+        )
+
+        parser = StrOutputParser()
+
+        chain = prompt | llm | parser
+
+        def generate():
+            full_response = ""
+
+            for chunk in chain.stream({
+                "user_prompt": user_prompt,
+                "context_text": context_text,
+                "user_msg": user_msg
+            }):
+                full_response += chunk
+                yield chunk
+            
+            bot_message = model.Messages(
+                chat_id = chat.id,
+                message = full_response,
+                embeded_message = None,
+                sender = "bot",
+                created_at = datetime.utcnow()
+            )
+
+            db.add(bot_message)
+            db.commit()
+
+        
+        return StreamingResponse(generate(), media_type="text/plain")
+
+        # result = [
+        #     {
+        #         "docs_id": c.document_id,
+        #         "chunk_text": c.chunk_text,
+        #         "page_number": c.page_number
+        #     }
+        #     for c in context_chunk
+        # ]
     
 
     return {
@@ -615,6 +722,47 @@ def send_message(chat_id: int, message: InputMessages, db: Session = Depends(get
         "sender": new_message.sender,
         "created_at": new_message.created_at
     }
+
+
+@app.get("/api/get-message/{chatbot_id}")
+def get_chat(chatbot_id: int , db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+    chatbot = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.id == chatbot_id).first()
+
+    if not chatbot:
+        raise HTTPException(
+            status_code=404,
+            detail="Chatbot not found"
+        )
+
+
+    is_user = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.user_id == validate.id).first()
+
+    if not is_user:
+        raise HTTPException(
+            status_code=404,
+            detail="access denied"
+        )
+    
+    chat = db.query(model.Chat).filter(model.Chat.chatbot_id == chatbot_id).first()
+    if not chat:
+        raise HTTPException(
+            status_code=404,
+            detail="Chat not found or not access denied"
+        )
+    
+    message = db.query(model.Messages).filter(model.Messages.chat_id == chat.id).order_by(model.Messages.created_at.asc()).all()
+
+    return [
+        {
+            "id": m.id,
+            "message": m.message,
+            "sender": m.sender,
+            "created_at": m.created_at
+
+        }
+        for m in message
+    ]
+
 
 
 @app.post("/api/is-document-selected/{doc_id}")
@@ -632,3 +780,8 @@ def select_document(doc_id: int, db: Session = Depends(get_db), validate: model.
     db.commit()
 
     return {"message": "document selected", "selected": document.selected}
+
+
+# API apakah sudah upload document atau belum
+# API untuk search dokumen berdasarkan judul
+# API untuk kirim verify code 6 digit
