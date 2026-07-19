@@ -36,3 +36,10 @@ class UpdateChatbotInformation(BaseModel):
 class InputMessages(BaseModel):
     message: str
     sender: str
+
+class Judul(BaseModel):
+    judul: str
+
+
+class VerifCode(BaseModel):
+    email: str

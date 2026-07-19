@@ -8,7 +8,7 @@ from database import SessionLocal, engine
 import model
 import os
 from sqlalchemy.orm import Session
-from schema import ChatbotCreate, UploadDocument, UserLogin, UserSignUp, CheckEmail, RefreshTokenRequest, UpdateChatbotInformation, InputMessages
+from schema import ChatbotCreate, UploadDocument, UserLogin, UserSignUp, CheckEmail, RefreshTokenRequest, UpdateChatbotInformation, InputMessages, Judul, VerifCode
 from model import Document, User
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -22,6 +22,9 @@ from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from fastapi.responses import StreamingResponse
+from urllib.parse import urlparse
+import random
+import resend
 
 
 app = FastAPI()
@@ -293,8 +296,38 @@ def check_email(email: CheckEmail, db: Session = Depends(get_db)):
     
     return {"message": "email ditemukan!"}
 
-@app.post("/api/verify-code/{user_id}")
-def verify_code():
+resend_api_key = os.environ["SEND_EMAIL_API_KEY"]
+
+@app.post("/api/send-verify-code")
+def verify_code(payload: VerifCode, db: Session = Depends(get_db)):
+    TOTAL_DIGITS = 6
+    CODE_DURATION = 3 # menit
+    arr = []
+
+    for i in range(TOTAL_DIGITS):
+        x = random.randint(1, 9)
+        arr.append(x)
+
+    random_num = int("".join(map(str, arr)))
+
+    email = db.query(model.User).filter(model.User.email == payload.email).first()
+
+    created_at = datetime.utcnow()
+
+    expire = created_at + timedelta(minutes=CODE_DURATION)
+
+    new_verif_code = model.VerifyCode(
+        user_id = email.id,
+        code = random_num,
+        status = "Active",
+        expire_at = expire,
+        created_at = created_at
+    )
+
+    db.add(new_verif_code)
+    db.commit()
+
+
     return
 
 
@@ -476,7 +509,7 @@ async def upload_document(chatbot_id: int, file: UploadFile = File(...), db: Ses
 
 
 @app.get("/api/get-document/{chatbot_id}")
-def get_document(chatbot_id: int, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+def get_document(chatbot_id: int, page: int = 1, limit: int = 10, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
     chatbot = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.id == chatbot_id, model.ChatbotInformation.user_id == validate.id).first()
     if not chatbot:
         raise HTTPException(
@@ -484,9 +517,18 @@ def get_document(chatbot_id: int, db: Session = Depends(get_db), validate: model
             detail="Chatbot not found"
         )
     
-    docs = db.query(model.Document).filter(model.Document.chatbot_id == chatbot.id).all()
+    offset = (page - 1) * limit
 
-    return docs
+    query = db.query(model.Document).filter(model.Document.chatbot_id == chatbot.id)
+
+    total = query.count()
+    docs = query.offset(offset).limit(limit).all()
+
+    return {
+        "data": docs,
+        "total_pages": -(-total // limit),
+        "current_page": page
+    }
 
 @app.get("/api/get-document-by-id/{doc_id}")
 def get_doc_by_id(doc_id: int,db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
@@ -499,15 +541,43 @@ def get_doc_by_id(doc_id: int,db: Session = Depends(get_db), validate: model.Use
     
     return {"docs_url": docs.file_url}
 
+
 @app.delete("/api/document-delete-by-id/{doc_id}")
-def delete_docs(doc_id: int ,db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+def delete_docs(doc_id: int, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
     docs = db.query(model.Document).filter(model.Document.id == doc_id).first()
     if not docs:
         raise HTTPException(
             status_code=400,
             detail="Document Not Found"
         )
-    
+
+    if docs.file_url:
+        try:
+            path = urlparse(docs.file_url).path
+            public_id_with_ext = path.split("/upload/")[-1]
+
+            parts = public_id_with_ext.split("/")
+            if parts[0].startswith("v") and parts[0][1:].isdigit():
+                parts = parts[1:]
+
+            public_id = "/".join(parts)  # dengan ekstensi
+
+            result = cloudinary.uploader.destroy(public_id, resource_type="raw", invalidate=True)
+
+            if result.get("result") != "ok":
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gagal menghapus file dari Cloudinary"
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gagal menghapus file dari Cloudinary: {str(e)}"
+            )
+
     db.delete(docs)
     db.commit()
 
@@ -609,10 +679,41 @@ def send_message(chatbot_id: int, message: InputMessages, db: Session = Depends(
     
     if message.sender == "bot":
         chat = db.query(model.Chat).filter(model.Chat.id == message.chat_id).first()
+        docs = db.query(model.Document).filter(model.Document.chatbot_id == chat.chatbot_id).first()
+
+        if not docs:
+            bot_message = model.Messages(
+                chat_id = chat.id,
+                message = "Please upload document",
+                embeded_message = None,
+                sender = "bot",
+                created_at = datetime.utcnow()
+            )
+
+            db.add(bot_message)
+            db.commit()
+            db.refresh(bot_message)
+            return StreamingResponse(iter([bot_message.message]), media_type="text/plain")
+
 
         docs_selected = db.query(model.Document).filter(model.Document.chatbot_id == chat.chatbot_id, model.Document.selected == True).all()
 
         selected_ids = [doc.id for doc in docs_selected]
+
+        if not docs_selected:
+            bot_message = model.Messages(
+                chat_id = chat.id,
+                message = "Please Select document",
+                embeded_message = None,
+                sender = "bot",
+                created_at = datetime.utcnow()
+            )
+
+            db.add(bot_message)
+            db.commit()
+            db.refresh(bot_message)
+
+            return StreamingResponse(iter([bot_message.message]), media_type="text/plain")
 
         # ambil pesan user terakhir di chat ini, karena request saat ini sender-nya "bot" (embeded_msg di atas None)
         user_msg_obj = db.query(model.Messages).filter(
@@ -781,7 +882,36 @@ def select_document(doc_id: int, db: Session = Depends(get_db), validate: model.
 
     return {"message": "document selected", "selected": document.selected}
 
+@app.post("/api/get-document-by-name/{chatbot_id}")
+def get_docs(chatbot_id: int, payload: Judul, page: int = 1, limit: int = 10, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
 
-# API apakah sudah upload document atau belum
-# API untuk search dokumen berdasarkan judul
+    cari = f"%{payload.judul}%"
+    offset = (page - 1) * limit
+
+    query = db.query(model.Document).filter(
+        model.Document.chatbot_id == chatbot_id,
+        model.Document.filename.ilike(cari)
+    )
+
+    total = query.count()
+    docs = query.offset(offset).limit(limit).all()
+
+    if not docs:
+        return {
+            "message": "docs not found",
+            "data": [],
+            "total_pages": 0,
+            "current_page": page
+        }
+
+    return {
+        "message": "docs found",
+        "data": docs,
+        "total_pages": -(-total // limit),  # ceiling division
+        "current_page": page
+    }
+
+# API apakah sudah upload document atau belum done
+# API untuk search dokumen berdasarkan judul done
 # API untuk kirim verify code 6 digit
+# update delete beneran di cloudinarynya done
