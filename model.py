@@ -44,7 +44,7 @@ class ChatbotInformation(Base):
     user_id = Column(Integer, ForeignKey(User.id))
     name = Column(String)
     prompt = Column(String)
-    model = Column(Enum("qwen/qwen3.6-27b", "llama-3.1-8b-instant", name="category_enum"))
+    model = Column(String)
 
 class Document(Base):
     __tablename__ = "document"

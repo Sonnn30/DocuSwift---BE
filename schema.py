@@ -5,7 +5,7 @@ from datetime import datetime
 class ChatbotCreate(BaseModel):
     name: str
     prompt: str
-    model: Literal["qwen/qwen3.6-27b", "llama-3.1-8b-instant"]
+    model: Literal["Openai/gpt-oss-20b", "llama-3.1-8b-instant"]
 
 class UploadDocument(BaseModel):
     file_name: str
@@ -31,7 +31,7 @@ class RefreshTokenRequest(BaseModel):
 class UpdateChatbotInformation(BaseModel):
     name: str
     prompt: str
-    model: Literal["qwen/qwen3.6-27b", "llama-3.1-8b-instant"]
+    model: Literal["Openai/gpt-oss-20b", "llama-3.1-8b-instant"]
 
 class InputMessages(BaseModel):
     message: str
@@ -43,3 +43,12 @@ class Judul(BaseModel):
 
 class VerifCode(BaseModel):
     email: str
+
+class CheckCode(BaseModel):
+    email: str
+    code: int
+
+class ChangePassword(BaseModel):
+    email: str
+    password: str
+    confirmed_password: str

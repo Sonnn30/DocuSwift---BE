@@ -8,7 +8,7 @@ from database import SessionLocal, engine
 import model
 import os
 from sqlalchemy.orm import Session
-from schema import ChatbotCreate, UploadDocument, UserLogin, UserSignUp, CheckEmail, RefreshTokenRequest, UpdateChatbotInformation, InputMessages, Judul, VerifCode
+from schema import ChatbotCreate, UploadDocument, UserLogin, UserSignUp, CheckEmail, RefreshTokenRequest, UpdateChatbotInformation, InputMessages, Judul, VerifCode, CheckCode, ChangePassword
 from model import Document, User
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -24,7 +24,9 @@ from langchain_core.prompts import PromptTemplate
 from fastapi.responses import StreamingResponse
 from urllib.parse import urlparse
 import random
-import resend
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 
 app = FastAPI()
@@ -296,7 +298,20 @@ def check_email(email: CheckEmail, db: Session = Depends(get_db)):
     
     return {"message": "email ditemukan!"}
 
-resend_api_key = os.environ["SEND_EMAIL_API_KEY"]
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+
+def send_email(to_email: str, subject: str, html_content: str):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_USER
+    msg["To"] = to_email
+
+    msg.attach(MIMEText(html_content, "html"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_USER, to_email, msg.as_string())
 
 @app.post("/api/send-verify-code")
 def verify_code(payload: VerifCode, db: Session = Depends(get_db)):
@@ -311,6 +326,9 @@ def verify_code(payload: VerifCode, db: Session = Depends(get_db)):
     random_num = int("".join(map(str, arr)))
 
     email = db.query(model.User).filter(model.User.email == payload.email).first()
+
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not registered")
 
     created_at = datetime.utcnow()
 
@@ -327,8 +345,128 @@ def verify_code(payload: VerifCode, db: Session = Depends(get_db)):
     db.add(new_verif_code)
     db.commit()
 
+    try:
+        send_email(
+            to_email=email.email,
+            subject="Docuswift Verify Code",
+            html_content=f"""
+                <h2>Your Docuswift Verification Code</h2>
+                <p>Your verification code:</p>
+                <h1 style="letter-spacing: 5px; color: #27bb88;">{random_num}</h1>
+                <p>Code valid for <strong>{CODE_DURATION} minutes</strong>.</p>
+                <p>If you feel not doing this, please ignore this email.</p>
+            """
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal kirim email: {str(e)}")
 
-    return
+
+    return {"message": "Verification code sent"}
+
+@app.post("/api/check-verify-code")
+def check_code(payload: CheckCode, db: Session = Depends(get_db)):
+    email = db.query(model.User).filter(model.User.email == payload.email).first()
+
+    is_code = db.query(model.VerifyCode).filter(model.VerifyCode.user_id == email.id, model.VerifyCode.status == 'Active').first()
+
+    
+    if datetime.utcnow() > is_code.expire_at:
+        is_code.status = "Expire"
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail="Code already expire, please send request new code"
+        )
+
+    if payload.code != is_code.code:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Code"
+        )
+    
+    is_code.status = 'Used'
+    db.commit()
+
+    return {"message": "code valid"}
+
+@app.post("/api/resend-verify-code")
+def resend_code(payload: VerifCode, db: Session = Depends(get_db)):
+    TOTAL_DIGITS = 6
+    CODE_DURATION = 3  # menit
+    arr = []
+
+    for i in range(TOTAL_DIGITS):
+        x = random.randint(1, 9)
+        arr.append(x)
+
+    random_num = int("".join(map(str, arr)))
+
+    email = db.query(model.User).filter(model.User.email == payload.email).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email tidak terdaftar")
+
+    # Expire semua kode Active yang lama ↓
+    db.query(model.VerifyCode).filter(
+        model.VerifyCode.user_id == email.id,
+        model.VerifyCode.status == "Active"
+    ).update({"status": "Expired"})
+    db.commit()
+
+    created_at = datetime.utcnow()
+    expire = created_at + timedelta(minutes=CODE_DURATION)
+
+    new_verif_code = model.VerifyCode(
+        user_id=email.id,
+        code=random_num,
+        status="Active",
+        expire_at=expire,
+        created_at=created_at
+    )
+
+    db.add(new_verif_code)
+    db.commit()
+
+    try:
+        send_email(
+            to_email=email.email,
+            subject="Docuswift Verify Code",
+            html_content=f"""
+                <h2>Your Docuswift Verification Code</h2>
+                <p>Your verification code:</p>
+                <h1 style="letter-spacing: 5px; color: #27bb88;">{random_num}</h1>
+                <p>Code valid for <strong>{CODE_DURATION} minutes</strong>.</p>
+                <p>If you feel not doing this, please ignore this email.</p>
+            """
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal kirim email: {str(e)}")
+
+    return {"message": "Code resent"}
+
+@app.put("/api/change-password")
+def change_password(payload: ChangePassword, db: Session = Depends(get_db)):
+    user = db.query(model.User).filter(model.User.email == payload.email).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="email not registered"
+        )
+
+    if payload.password != payload.confirmed_password:
+        raise HTTPException(
+            status_code=400,
+            detail="password and confirmed password not same, please check again"
+        )
+    
+    hashed_password = password_context.hash(payload.password)
+
+    user.hashed_password = hashed_password
+
+    db.commit()
+
+
+    return {"message": "success change password"}
 
 
 @app.post("/api/createBot")
@@ -392,25 +530,50 @@ def update_chatbot(chatbot_id: int,  chatbot_update: UpdateChatbotInformation, d
     return chatbot
     
 @app.delete("/api/chatbot-delete/{chatbot_id}")
-def delete_chatbot(chatbot_id: int,db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
-    chatbot = db.query(model.ChatbotInformation).filter(model.ChatbotInformation.id == chatbot_id, model.ChatbotInformation.user_id == validate.id).first()
+def delete_chatbot(chatbot_id: int, db: Session = Depends(get_db), validate: model.User = Depends(validate_token)):
+    chatbot = db.query(model.ChatbotInformation).filter(
+        model.ChatbotInformation.id == chatbot_id,
+        model.ChatbotInformation.user_id == validate.id
+    ).first()
+
     if not chatbot:
         raise HTTPException(
             status_code=400,
             detail="Chatbot not found"
         )
-    
-    chat_id = [c.id for c in db.query(model.Chat.id).filter(model.Chat.chatbot_id == chatbot.id).all()]
-    document_id = [d.id for d in db.query(model.Document.id).filter(model.Document.chatbot_id == chatbot.id).all()]
 
+    chat_id = [c.id for c in db.query(model.Chat.id).filter(model.Chat.chatbot_id == chatbot.id).all()]
+    documents = db.query(model.Document).filter(model.Document.chatbot_id == chatbot.id).all()
+    document_id = [d.id for d in documents]
+
+    # Hapus vector data
     if document_id:
         db.query(model.VectorData).filter(model.VectorData.document_id.in_(document_id)).delete(synchronize_session=False)
 
+    # Hapus file di Cloudinary untuk setiap document
+    for doc in documents:
+        if doc.file_url:
+            try:
+                path = urlparse(doc.file_url).path
+                public_id_with_ext = path.split("/upload/")[-1]
+
+                parts = public_id_with_ext.split("/")
+                if parts[0].startswith("v") and parts[0][1:].isdigit():
+                    parts = parts[1:]
+
+                public_id = "/".join(parts)
+
+                cloudinary.uploader.destroy(public_id, resource_type="raw", invalidate=True)
+
+            except Exception:
+                pass  # Lanjut hapus data lain meski cloudinary gagal
+
+    # Hapus messages
     if chat_id:
         db.query(model.Messages).filter(model.Messages.chat_id.in_(chat_id)).delete(synchronize_session=False)
 
+    # Hapus document dan chat dari DB
     db.query(model.Document).filter(model.Document.chatbot_id == chatbot_id).delete(synchronize_session=False)
-
     db.query(model.Chat).filter(model.Chat.chatbot_id == chatbot_id).delete(synchronize_session=False)
 
     db.delete(chatbot)
