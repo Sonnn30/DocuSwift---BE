@@ -1,7 +1,12 @@
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import create_engine
+from dotenv import load_dotenv
+import os
+# Load file .env
+load_dotenv()
 
-db_url = "postgresql://postgres:W1l$0n30@localhost:5432/DocuSwift"
+# Ambil nilai dari .env
+db_url = os.getenv("DATABASE_URL")
 engine = create_engine(db_url)
 
 # auto commit itu buat menyimpan perubahan secara permanen di database
