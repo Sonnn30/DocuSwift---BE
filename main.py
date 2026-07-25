@@ -34,7 +34,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     # ini untuk allow port ini bisa akses endpoint
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "https://docuswift.wilsonprajnawira345.workers.dev", "https://www.docuswift.online"],
     allow_methods = ["*"] ,
     allow_headers=["*"]
 )
