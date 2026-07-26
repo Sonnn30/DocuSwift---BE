@@ -22,7 +22,7 @@ from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from fastapi.responses import StreamingResponse
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 import random
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -561,7 +561,7 @@ def delete_chatbot(chatbot_id: int, db: Session = Depends(get_db), validate: mod
                 if parts[0].startswith("v") and parts[0][1:].isdigit():
                     parts = parts[1:]
 
-                public_id = "/".join(parts)
+                public_id = unquote("/".join(parts))
 
                 cloudinary.uploader.destroy(public_id, resource_type="raw", invalidate=True)
 
@@ -723,7 +723,7 @@ def delete_docs(doc_id: int, db: Session = Depends(get_db), validate: model.User
             if parts[0].startswith("v") and parts[0][1:].isdigit():
                 parts = parts[1:]
 
-            public_id = "/".join(parts)  # dengan ekstensi
+            public_id = unquote("/".join(parts))  # dengan ekstensi
 
             result = cloudinary.uploader.destroy(public_id, resource_type="raw", invalidate=True)
 
